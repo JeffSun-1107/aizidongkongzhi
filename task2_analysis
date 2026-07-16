@@ -1,0 +1,490 @@
+"""
+任务二：加热系统智能辨识与参数优化
+System Identification and PID Optimization for Heating Furnace
+Optimized version with vectorized simulation for speed.
+"""
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from scipy import signal
+from scipy.optimize import minimize, differential_evolution
+import warnings
+warnings.filterwarnings('ignore')
+
+plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
+plt.rcParams['axes.unicode_minus'] = False
+
+# ============ 1. Load Data ============
+df = pd.read_csv('temperature.csv')
+t = df['time'].values
+y = df['temperature'].values
+u = df['volte'].values
+
+print(f"Data points: {len(t)}, Time range: [{t[0]}, {t[-1]}]s")
+print(f"Temperature range: [{y.min():.4f}, {y.max():.4f}] deg C")
+print(f"Input voltage: {u[0]}V (constant step)")
+
+y0 = y[0]
+y_inf = y[-1]
+u_norm = u[0]
+
+# ============ 2. System Identification ============
+print("\n" + "="*60)
+print("SYSTEM IDENTIFICATION")
+print("="*60)
+
+# ---- Method 1: Area Method ----
+def area_method(t, y, u_step):
+    y_inf_local = y[-1]
+    y0_local = y[0]
+    K = (y_inf_local - y0_local) / u_step
+    y_n = (y - y0_local) / (y_inf_local - y0_local)
+    A0 = np.trapezoid(1 - y_n, t)
+    T_est = A0 / (1 + 0.1)
+    tau_est = A0 - T_est
+    return K, T_est, tau_est
+
+K1, T1, tau1 = area_method(t, y, u_norm)
+print(f"\n[Area Method] K={K1:.4f}, T={T1:.2f}, tau={tau1:.2f}")
+
+# ---- Method 2: Two-Point Method ----
+def two_point_method(t, y, u_step):
+    y_inf_local = y[-1]
+    y0_local = y[0]
+    K = (y_inf_local - y0_local) / u_step
+    y_n = (y - y0_local) / (y_inf_local - y0_local)
+    t1 = np.interp(0.283, y_n, t)
+    t2 = np.interp(0.632, y_n, t)
+    T_est = 1.5 * (t2 - t1)
+    tau_est = max(0, t2 - T_est)
+    if tau_est < 1:
+        tau_est = t1 * 0.1
+        T_est = t2 - tau_est
+    return K, T_est, tau_est
+
+K2, T2, tau2 = two_point_method(t, y, u_norm)
+print(f"\n[Two-Point Method] K={K2:.4f}, T={T2:.2f}, tau={tau2:.2f}")
+
+# ---- Method 3: FOPDT Least Squares ----
+# Vectorized FOPDT response
+def fopdt_response_vec(t, K, T, tau, u_step, y0):
+    y_pred = np.where(t >= tau, y0 + K * u_step * (1 - np.exp(-(t - tau) / T)), y0)
+    return y_pred
+
+def objective_fopdt(params, t, y, u_step, y0):
+    T, tau = params
+    y_pred = fopdt_response_vec(t, K3_const, T, tau, u_step, y0)
+    return np.sum((y - y_pred)**2)
+
+K3_const = (y[-1] - y[0]) / u_norm
+_, T_init, tau_init = two_point_method(t, y, u_norm)
+
+res = minimize(objective_fopdt, [T_init, max(tau_init, 1)],
+               args=(t, y, u_norm, y0),
+               bounds=[(500, 8000), (0, 1000)], method='L-BFGS-B')
+T3, tau3 = res.x
+K3 = K3_const
+print(f"\n[LS FOPDT] K={K3:.4f}, T={T3:.2f}, tau={tau3:.2f}")
+
+# ---- Method 4: SOPDT Least Squares ----
+def sopdt_response_vec(t, K, T1, T2, tau, u_step, y0):
+    t_eff = np.maximum(t - tau, 0)
+    if abs(T1 - T2) < 1e-3:
+        y_pred = y0 + K * u_step * (1 - (1 + t_eff/T1) * np.exp(-t_eff/T1))
+    else:
+        y_pred = y0 + K * u_step * (1 - (T1*np.exp(-t_eff/T1) - T2*np.exp(-t_eff/T2))/(T1-T2))
+    y_pred[t < tau] = y0
+    return y_pred
+
+def objective_sopdt(params, t, y, u_step, y0):
+    T1, T2, tau = params
+    y_pred = sopdt_response_vec(t, K4_const, T1, T2, tau, u_step, y0)
+    return np.sum((y - y_pred)**2)
+
+K4_const = (y[-1] - y[0]) / u_norm
+res4 = minimize(objective_sopdt, [T3*0.9, T3*0.1, tau3],
+                args=(t, y, u_norm, y0),
+                bounds=[(100, 8000), (10, 5000), (0, 500)], method='L-BFGS-B')
+T1_4, T2_4, tau4 = res4.x
+K4 = K4_const
+print(f"\n[LS SOPDT] K={K4:.4f}, T1={T1_4:.2f}, T2={T2_4:.2f}, tau={tau4:.2f}")
+
+# ============ 3. Model Validation ============
+print("\n" + "="*60)
+print("MODEL VALIDATION")
+print("="*60)
+
+y_pred1 = fopdt_response_vec(t, K1, T1, tau1, u_norm, y0)
+y_pred2 = fopdt_response_vec(t, K2, T2, tau2, u_norm, y0)
+y_pred3 = fopdt_response_vec(t, K3, T3, tau3, u_norm, y0)
+y_pred4 = sopdt_response_vec(t, K4, T1_4, T2_4, tau4, u_norm, y0)
+
+def calc_metrics(y_true, y_pred):
+    rmse = np.sqrt(np.mean((y_true - y_pred)**2))
+    mae = np.mean(np.abs(y_true - y_pred))
+    ss_res = np.sum((y_true - y_pred)**2)
+    ss_tot = np.sum((y_true - np.mean(y_true))**2)
+    r2 = 1 - ss_res / ss_tot
+    fit = 100 * (1 - np.linalg.norm(y_true - y_pred) / np.linalg.norm(y_true - np.mean(y_true)))
+    return rmse, mae, r2, fit
+
+for name, yp in [('Area Method', y_pred1), ('Two-Point', y_pred2),
+                  ('LS FOPDT', y_pred3), ('LS SOPDT', y_pred4)]:
+    rmse, mae, r2, fit = calc_metrics(y, yp)
+    print(f"{name}: RMSE={rmse:.4f}, MAE={mae:.4f}, R2={r2:.6f}, Fit={fit:.2f}%")
+
+# Select LS FOPDT for PID design (good balance of simplicity and accuracy)
+K_best, T_best, tau_best = K3, T3, tau3
+print(f"\nSelected Model: G(s) = {K_best:.4f} * exp(-{tau_best:.2f}s) / ({T_best:.2f}s + 1)")
+
+# ============ 4. PID Controller Optimization ============
+print("\n" + "="*60)
+print("PID CONTROLLER OPTIMIZATION")
+print("="*60)
+
+SP = 35.0  # setpoint
+dt_sim = 5.0  # simulation time step (coarser for speed)
+t_sim = np.arange(0, 6000, dt_sim)
+n_sim = len(t_sim)
+
+# Fast FOPDT + PID simulation (vectorized state-space)
+def sim_pid_fast(K, T, tau, Kp, Ki, Kd, t_vec, dt, SP, y0):
+    """Optimized simulation of PID-controlled FOPDT plant"""
+    n = len(t_vec)
+    y_out = np.zeros(n)
+    u_out = np.zeros(n)
+    y_out[0] = y0
+
+    integral = 0.0
+    prev_error = SP - y0
+    delay_steps = int(np.ceil(tau / dt))
+    u_buffer = np.zeros(delay_steps + 1)
+    u_buffer[:] = u_norm
+
+    # Precompute Euler step
+    alpha = dt / T
+    K_alpha = K * alpha
+
+    for i in range(1, n):
+        # Delayed input
+        u_delayed = u_buffer[0]
+        u_buffer[:-1] = u_buffer[1:]
+
+        # PID
+        error = SP - y_out[i-1]
+        integral += error * dt
+
+        # Clamp integral (anti-windup)
+        integral = np.clip(integral, -50/Ki if Ki > 1e-9 else -50, 50/Ki if Ki > 1e-9 else 50)
+
+        derivative = (error - prev_error) / dt
+        prev_error = error
+
+        u_raw = Kp * error + Ki * integral + Kd * derivative
+        u_current = np.clip(u_raw, 0, 10)
+
+        # Anti-windup back-calculation
+        if abs(u_current - u_raw) > 1e-6:
+            integral -= error * dt
+
+        u_buffer[-1] = u_current
+        u_out[i] = u_current
+
+        # Plant dynamics (Euler)
+        y_out[i] = y_out[i-1] + (K_alpha * u_delayed - alpha * y_out[i-1])
+
+    return y_out, u_out
+
+# Performance metrics
+def calc_perf(t_vec, y_out, u_out, SP):
+    err = SP - y_out
+    n_ss = max(1, len(t_vec) // 5)
+    y_ss = y_out[-n_ss:]
+    steady_err = abs(np.mean(y_ss) - SP)
+    overshoot = max(0, (np.max(y_out) - SP) / SP * 100) if np.max(y_out) > SP else 0
+
+    # Rise time
+    try:
+        tr_start = np.interp(SP*0.1 + (1-0.1)*y_out[0], y_out, t_vec)
+        tr_end = np.interp(SP*0.9, y_out, t_vec)
+        rise_time = tr_end - tr_start
+    except:
+        rise_time = np.nan
+
+    # Settling time (5% band)
+    try:
+        upper = SP * 1.05
+        lower = SP * 0.95
+        for i in range(len(y_out)-1, -1, -1):
+            if y_out[i] > upper or y_out[i] < lower:
+                settling_time = t_vec[min(i+1, len(t_vec)-1)]
+                break
+            settling_time = t_vec[-1]
+    except:
+        settling_time = np.nan
+
+    peak_time = t_vec[np.argmax(y_out)]
+
+    # Error integrals
+    IAE = np.trapezoid(np.abs(err), t_vec)
+    ISE = np.trapezoid(err**2, t_vec)
+    ITAE = np.trapezoid(t_vec * np.abs(err), t_vec)
+
+    # Decay ratio
+    try:
+        peaks = []
+        for i in range(2, len(y_out)-1):
+            if y_out[i] > y_out[i-1] and y_out[i] > y_out[i+1] and y_out[i] > SP:
+                peaks.append(y_out[i])
+        if len(peaks) >= 2:
+            a1, a2 = peaks[0]-SP, peaks[1]-SP
+            decay_ratio = (a1-a2)/a1 if a1 > 0 else 0
+        else:
+            decay_ratio = 0
+    except:
+        decay_ratio = 0
+
+    return {'Steady-state Error': steady_err, 'Overshoot(%)': overshoot,
+            'Rise Time(s)': rise_time, 'Settling Time(s)': settling_time,
+            'Peak Time(s)': peak_time, 'IAE': IAE, 'ISE': ISE, 'ITAE': ITAE,
+            'Decay Ratio': decay_ratio}
+
+# Objective function for optimization
+def obj_pid(params, K, T, tau, t_vec, dt, SP, y0):
+    Kp, Ki, Kd = params
+    try:
+        y_sim, u_sim = sim_pid_fast(K, T, tau, Kp, Ki, Kd, t_vec, dt, SP, y0)
+        err = SP - y_sim
+        itae_val = np.trapezoid(t_vec * np.abs(err), t_vec)
+        overshoot_val = max(0, np.max(y_sim) - SP) * 100
+        # Penalize oscillations
+        osc_pen = 0
+        for i in range(3, len(y_sim)):
+            if (y_sim[i]-y_sim[i-1]) * (y_sim[i-1]-y_sim[i-2]) < 0:
+                osc_pen += abs(y_sim[i]-y_sim[i-1])
+        J = itae_val * 0.01 + overshoot_val * 10 + osc_pen * 5
+        return J
+    except:
+        return 1e10
+
+# Z-N initial tuning
+Kp_zn = 1.2 * T_best / (K_best * max(tau_best, 1))
+Ki_zn = Kp_zn / (2 * max(tau_best, 1))
+Kd_zn = Kp_zn * 0.5 * max(tau_best, 1)
+
+print(f"Z-N Initial: Kp={Kp_zn:.4f}, Ki={Ki_zn:.6f}, Kd={Kd_zn:.4f}")
+
+# Run DE optimization (reduced iterations for speed)
+print("Running DE optimization...")
+bounds = [(0.1, 10), (0.0001, 0.05), (0.1, 300)]
+args = (K_best, T_best, tau_best, t_sim, dt_sim, SP, y0)
+
+de_result = differential_evolution(
+    obj_pid, bounds, args=args,
+    maxiter=200, popsize=20, seed=42,
+    mutation=(0.5, 1.5), recombination=0.9,
+    polish=True
+)
+
+Kp_opt, Ki_opt, Kd_opt = de_result.x
+print(f"DE Optimized: Kp={Kp_opt:.4f}, Ki={Ki_opt:.6f}, Kd={Kd_opt:.4f}")
+
+# Run PSO
+print("Running PSO optimization...")
+def pso_optimize(obj_func, bounds, args, n_particles=25, n_iterations=150):
+    n_dims = len(bounds)
+    pos = np.zeros((n_particles, n_dims))
+    vel = np.zeros((n_particles, n_dims))
+    for d in range(n_dims):
+        pos[:, d] = np.random.uniform(bounds[d][0], bounds[d][1], n_particles)
+
+    p_best_pos = pos.copy()
+    p_best_val = np.array([obj_func(p, *args) for p in pos])
+    g_best_idx = np.argmin(p_best_val)
+    g_best_pos = p_best_pos[g_best_idx].copy()
+    g_best_val = p_best_val[g_best_idx]
+
+    w, c1, c2 = 0.7, 1.5, 1.5
+    history = [g_best_val]
+
+    for it in range(n_iterations):
+        for i in range(n_particles):
+            r1, r2 = np.random.random(n_dims), np.random.random(n_dims)
+            vel[i] = w*vel[i] + c1*r1*(p_best_pos[i]-pos[i]) + c2*r2*(g_best_pos-pos[i])
+            pos[i] += vel[i]
+            for d in range(n_dims):
+                pos[i, d] = np.clip(pos[i, d], bounds[d][0], bounds[d][1])
+
+            val = obj_func(pos[i], *args)
+            if val < p_best_val[i]:
+                p_best_val[i] = val
+                p_best_pos[i] = pos[i].copy()
+                if val < g_best_val:
+                    g_best_val = val
+                    g_best_pos = pos[i].copy()
+        w *= 0.99
+        history.append(g_best_val)
+        if it % 50 == 0:
+            print(f"  PSO iter {it}: best={g_best_val:.2f}")
+
+    return g_best_pos, g_best_val, history
+
+pso_res, pso_val, pso_hist = pso_optimize(obj_pid, bounds, args)
+Kp_pso, Ki_pso, Kd_pso = pso_res
+print(f"PSO Optimized: Kp={Kp_pso:.4f}, Ki={Ki_pso:.6f}, Kd={Kd_pso:.4f}")
+
+# ============ 5. Simulate and Compare ============
+print("\n" + "="*60)
+print("COMPARISON OF PID TUNING METHODS")
+print("="*60)
+
+t_long = np.arange(0, 8000, dt_sim)
+
+y_zn, u_zn = sim_pid_fast(K_best, T_best, tau_best, Kp_zn, Ki_zn, Kd_zn, t_long, dt_sim, SP, y0)
+perf_zn = calc_perf(t_long, y_zn, u_zn, SP)
+
+y_de, u_de = sim_pid_fast(K_best, T_best, tau_best, Kp_opt, Ki_opt, Kd_opt, t_long, dt_sim, SP, y0)
+perf_de = calc_perf(t_long, y_de, u_de, SP)
+
+y_pso, u_pso = sim_pid_fast(K_best, T_best, tau_best, Kp_pso, Ki_pso, Kd_pso, t_long, dt_sim, SP, y0)
+perf_pso = calc_perf(t_long, y_pso, u_pso, SP)
+
+for name, perf in [('Z-N', perf_zn), ('DE Optimized', perf_de), ('PSO Optimized', perf_pso)]:
+    print(f"\n{name}:")
+    for k, v in perf.items():
+        if isinstance(v, float):
+            print(f"  {k}: {v:.4f}")
+        else:
+            print(f"  {k}: {v}")
+
+# ============ 6. Generate Figures ============
+print("\nGenerating figures...")
+
+# Figure 1: System Identification
+fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+ax = axes[0, 0]
+ax.plot(t, y, 'b-', linewidth=0.5, label='Measured Temperature')
+ax.set_xlabel('Time (s)'); ax.set_ylabel('Temperature (deg C)')
+ax.set_title('Step Response of Heating Furnace')
+ax.legend(); ax.grid(True)
+
+ax = axes[0, 1]
+ax.plot(t[::50], y[::50], 'b.', markersize=2, alpha=0.3, label='Measured (sampled)')
+ax.plot(t, y_pred1, 'r--', linewidth=1, label='Area Method')
+ax.plot(t, y_pred2, 'g--', linewidth=1, label='Two-Point Method')
+ax.plot(t, y_pred3, 'm-', linewidth=1.5, label='LS FOPDT')
+ax.set_xlabel('Time (s)'); ax.set_ylabel('Temperature (deg C)')
+ax.set_title('Model Fitting Comparison')
+ax.legend(fontsize=8); ax.grid(True)
+
+ax = axes[1, 0]
+ax.plot(t, y - y_pred3, 'm-', linewidth=0.5, label='LS FOPDT Error')
+ax.plot(t, y - y_pred4, 'c-', linewidth=0.5, label='LS SOPDT Error')
+ax.set_xlabel('Time (s)'); ax.set_ylabel('Error (deg C)')
+ax.set_title('Model Fitting Errors')
+ax.legend(fontsize=8); ax.grid(True)
+
+ax = axes[1, 1]
+ax.plot(t[::50], y[::50], 'b.', markersize=2, alpha=0.3, label='Measured')
+ax.plot(t, y_pred3, 'm-', linewidth=1.5, label='FOPDT Model')
+ax.plot(t, y_pred4, 'c--', linewidth=1.5, label='SOPDT Model')
+ax.set_xlabel('Time (s)'); ax.set_ylabel('Temperature (deg C)')
+ax.set_title('FOPDT vs SOPDT Comparison')
+ax.legend(fontsize=8); ax.grid(True)
+plt.tight_layout(); plt.savefig('fig1_identification.png', dpi=150, bbox_inches='tight'); plt.close()
+print("Saved fig1_identification.png")
+
+# Figure 2: PID Optimization Results
+fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+# 2a: Temperature response
+ax = axes[0, 0]
+ax.plot(t_long, y_zn, 'b-', linewidth=1, label=f'Z-N (Kp={Kp_zn:.2f})')
+ax.plot(t_long, y_de, 'r-', linewidth=1.5, label=f'DE Optimized (Kp={Kp_opt:.2f})')
+ax.plot(t_long, y_pso, 'g--', linewidth=1.5, label=f'PSO Optimized (Kp={Kp_pso:.2f})')
+ax.axhline(y=SP, color='k', linestyle=':', linewidth=1, label=f'SP = {SP} deg C')
+ax.axhline(y=SP*1.05, color='gray', linestyle=':', linewidth=0.5)
+ax.axhline(y=SP*0.95, color='gray', linestyle=':', linewidth=0.5)
+ax.set_xlabel('Time (s)'); ax.set_ylabel('Temperature (deg C)')
+ax.set_title('Closed-Loop Temperature Response')
+ax.legend(fontsize=7); ax.grid(True)
+
+# 2b: Control signals
+ax = axes[0, 1]
+ax.plot(t_long, u_zn, 'b-', linewidth=1, label='Z-N')
+ax.plot(t_long, u_de, 'r-', linewidth=1.5, label='DE Opt')
+ax.plot(t_long, u_pso, 'g--', linewidth=1.5, label='PSO Opt')
+ax.set_xlabel('Time (s)'); ax.set_ylabel('Control Signal (V)')
+ax.set_title('PID Control Signals')
+ax.legend(fontsize=8); ax.grid(True)
+
+# 2c: Zoomed first 2000s
+ax = axes[1, 0]
+idx_z = t_long <= 2000
+ax.plot(t_long[idx_z], y_zn[idx_z], 'b-', linewidth=1, label='Z-N')
+ax.plot(t_long[idx_z], y_de[idx_z], 'r-', linewidth=1.5, label='DE Opt')
+ax.plot(t_long[idx_z], y_pso[idx_z], 'g--', linewidth=1.5, label='PSO Opt')
+ax.axhline(y=SP, color='k', linestyle=':', linewidth=1)
+ax.set_xlabel('Time (s)'); ax.set_ylabel('Temperature (deg C)')
+ax.set_title('Response Zoom (0-2000s)')
+ax.legend(fontsize=8); ax.grid(True)
+
+# 2d: PSO convergence
+ax = axes[1, 1]
+ax.plot(pso_hist, 'b-', linewidth=1)
+ax.set_xlabel('Iteration'); ax.set_ylabel('Objective Value')
+ax.set_title('PSO Convergence Curve')
+ax.grid(True); ax.set_yscale('log')
+plt.tight_layout(); plt.savefig('fig2_pid_optimization.png', dpi=150, bbox_inches='tight'); plt.close()
+print("Saved fig2_pid_optimization.png")
+
+# Figure 3: Performance metrics comparison
+fig, axes = plt.subplots(1, 3, figsize=(14, 4.5))
+methods = ['Z-N', 'DE Opt', 'PSO Opt']
+colors = ['#3498db', '#e74c3c', '#2ecc71']
+
+ax = axes[0]
+x = np.arange(3); w = 0.25
+ax.bar(x-w, [perf_zn['IAE'], perf_de['IAE'], perf_pso['IAE']], w, label='IAE', color='#3498db')
+ax.bar(x, [perf_zn['ISE'], perf_de['ISE'], perf_pso['ISE']], w, label='ISE', color='#e74c3c')
+ax.bar(x+w, [perf_zn['ITAE'], perf_de['ITAE'], perf_pso['ITAE']], w, label='ITAE', color='#2ecc71')
+ax.set_xticks(x); ax.set_xticklabels(methods)
+ax.set_ylabel('Value'); ax.set_title('Error Integral Indices')
+ax.legend(); ax.grid(True, axis='y')
+
+ax = axes[1]
+ax.bar(methods, [perf_zn['Overshoot(%)'], perf_de['Overshoot(%)'], perf_pso['Overshoot(%)']], color=colors)
+ax.set_ylabel('Overshoot (%)'); ax.set_title('Overshoot')
+ax.grid(True, axis='y')
+
+ax = axes[2]
+ax.bar(methods, [perf_zn['Settling Time(s)'], perf_de['Settling Time(s)'], perf_pso['Settling Time(s)']], color=colors)
+ax.set_ylabel('Time (s)'); ax.set_title('Settling Time (5% band)')
+ax.grid(True, axis='y')
+plt.tight_layout(); plt.savefig('fig3_performance_metrics.png', dpi=150, bbox_inches='tight'); plt.close()
+print("Saved fig3_performance_metrics.png")
+
+# ============ 7. Save Results ============
+import json
+results = {
+    'identification': {
+        'area_method': {'K': float(K1), 'T': float(T1), 'tau': float(tau1)},
+        'two_point': {'K': float(K2), 'T': float(T2), 'tau': float(tau2)},
+        'ls_fopdt': {'K': float(K3), 'T': float(T3), 'tau': float(tau3)},
+        'ls_sopdt': {'K': float(K4), 'T1': float(T1_4), 'T2': float(T2_4), 'tau': float(tau4)},
+    },
+    'best_model': {'K': float(K_best), 'T': float(T_best), 'tau': float(tau_best),
+                   'transfer_function': f'G(s) = {K_best:.4f} * exp(-{tau_best:.2f}s) / ({T_best:.2f}s + 1)'},
+    'pid_zn': {'Kp': float(Kp_zn), 'Ki': float(Ki_zn), 'Kd': float(Kd_zn), **{k: float(v) if isinstance(v, (np.floating, float, np.integer, int)) else v for k, v in perf_zn.items()}},
+    'pid_de': {'Kp': float(Kp_opt), 'Ki': float(Ki_opt), 'Kd': float(Kd_opt), **{k: float(v) if isinstance(v, (np.floating, float, np.integer, int)) else v for k, v in perf_de.items()}},
+    'pid_pso': {'Kp': float(Kp_pso), 'Ki': float(Ki_pso), 'Kd': float(Kd_pso), **{k: float(v) if isinstance(v, (np.floating, float, np.integer, int)) else v for k, v in perf_pso.items()}},
+}
+
+with open('task2_results.json', 'w', encoding='utf-8') as f:
+    json.dump(results, f, ensure_ascii=False, indent=2, default=str)
+
+print("\nAll results saved to task2_results.json")
+print("ANALYSIS COMPLETE")
